@@ -1,12 +1,19 @@
+"""ESY Sunhome Battery Controller - Binary Protocol Version.
+
+Uses binary MQTT protocol on /ESY/PVVC/{device_sn}/UP for real-time data.
+API calls still used for mode changes and triggering updates.
+"""
+
 import asyncio
 import contextlib
 import json
 import logging
-from typing import Any
-from unicodedata import name
+from typing import Any, Optional
 
 import aiomqtt
+
 from .esysunhome import ESYSunhomeAPI
+from .protocol import ESYTelemetryParser, parse_telemetry
 from .const import (
     ATTR_DEVICE_ID,
     ATTR_SOC,
@@ -36,205 +43,147 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+ESY_MQTT_USERNAME = ""
+ESY_MQTT_PASSWORD = ""
+
 
 class BatteryState:
-    """Represents the current system state."""
+    """Represents the current system state - compatible with legacy sensors."""
 
-    # AI Mode isn't currently available and i don't see the other modes in the app so they're commented out for now
+    # Mode mapping: MQTT systemRunMode value -> Display Name
+    #
+    # 1. MQTT systemRunMode -> display code (via EnergyFlowOptimize.e())
+    # 2. display code -> mode name string (via setModeType())
+    #
+    # MQTT systemRunMode values to write for each mode:
+    # Regular Mode = 1, Emergency Mode = 4, Sell Mode = 3, BEM = 5
+    
+    # This maps MQTT systemRunMode to display name (for READING from inverter)
+    modes_from_mqtt = {
+        1: "Regular Mode",           # MQTT 1 -> code 1 -> Regular
+        4: "Emergency Mode",         # MQTT 4 -> code 2 -> Emergency
+        3: "Electricity Sell Mode",  # MQTT 3 -> code 3 -> Sell
+        5: "Battery Energy Management", # MQTT 5 -> BEM (default)
+        0: "Battery Priority Mode",  # MQTT 0 -> code 6 -> Battery Priority
+        2: "Grid Priority Mode",     # MQTT 2 -> code 7 -> Grid Priority
+        6: "PV Mode",                # MQTT 6 -> code 9 -> PV
+        7: "Forced Off Grid Mode",   # MQTT 7 -> code 10 -> Forced Off Grid
+    }
+    
+    # This maps display name to MQTT value (for WRITING to inverter)
+    # Only modes available in user's app (Regular, Emergency, Sell, BEM)
+    modes_to_mqtt = {
+        "Regular Mode": 1,
+        "Emergency Mode": 4,
+        "Electricity Sell Mode": 3,
+        "Battery Energy Management": 5,
+    }
+    
+    # For the HA dropdown - simple dict of available modes
     modes = {
         1: "Regular Mode",
         2: "Emergency Mode",
         3: "Electricity Sell Mode",
-        #4: "AI Mode",
-        5: "Battery Energy Management",
-        # 6: "Battery Priority Mode",
-        # 7: "Grid Priority Mode",
-        # 8: "AC Charging Off & Backup Mode",
-        # 9: "PV Mode",
-        # 10: "Forced Off-grid Mode",
-    }
-
-    attr_map = {
-        ATTR_DEVICE_ID: (
-            0,
-            None,
-            None,
-        ),  # Assuming deviceId is directly returned as an integer
-        ATTR_SOC: (
-            1,
-            lambda x: x,
-            None,
-        ),  # State of Charge, just return the raw value (percentage)
-        ATTR_GRID_POWER: (2, lambda x: x, None),  # Grid Power, raw value (W)
-        ATTR_LOAD_POWER: (3, lambda x: x, None),  # Load Power, raw value (W)
-        ATTR_BATTERY_POWER: (4, lambda x: x, None),  # Battery Power, raw value (W)
-        ATTR_PV_POWER: (5, lambda x: x, None),  # PV Power, raw value (W)
-        ATTR_BATTERY_IMPORT: (
-            6,
-            lambda x: x if x > 0 else 0,
-            None,
-        ),  # Battery Import, 0 if value <= 0
-        ATTR_BATTERY_EXPORT: (
-            7,
-            lambda x: x if x > 0 else 0,
-            None,
-        ),  # Battery Export, 0 if value <= 0
-        ATTR_GRID_IMPORT: (
-            8,
-            lambda x: x if x > 0 else 0,
-            None,
-        ),  # Grid Import, 0 if value <= 0
-        ATTR_GRID_EXPORT: (
-            9,
-            lambda x: x if x > 0 else 0,
-            None,
-        ),  # Grid Export, 0 if value <= 0
-        ATTR_GRID_ACTIVE: (
-            10,
-            lambda x: x,
-            None,
-        ),  # Grid Active, raw value (could be 0, 1, or 2)
-        ATTR_LOAD_ACTIVE: (
-            11,
-            lambda x: x,
-            None,
-        ),  # Load Active, raw value (could be 0 or 1)
-        ATTR_PV_ACTIVE: (
-            12,
-            lambda x: x,
-            None,
-        ),  # PV Active, raw value (could be 0 or 1)
-        ATTR_BATTERY_ACTIVE: (
-            13,
-            lambda x: x,
-            None,
-        ),  # Battery Active, raw value (could be 0 or 1)
-        ATTR_SCHEDULE_MODE: (
-            14,
-            lambda x: BatteryState.modes.get(x, "Unknown Mode"),
-            None,
-        ),
-        ATTR_HEATER_STATE: (
-            15,
-            lambda x: x,
-            None,
-        ),  # Heater State, raw value (N/A, 0, etc.)
-        ATTR_BATTERY_STATUS: (
-            16,
-            lambda x: "Idle"
-            if x == 0
-            else "Charging"
-            if x == 1
-            else "In Use"
-            if x == 5
-            else "Unknown",
-            None,
-        ),  # Map battery status code
-        ATTR_SYSTEM_RUN_STATUS: (
-            17,
-            lambda x: x,
-            None,
-        ),  # System Run Status, raw value (integer)
-        ATTR_DAILY_POWER_GEN: (
-            18,
-            lambda x: x,
-            None,
-        ),  # Daily Power Generation, raw value (kWh)
-        ATTR_RATED_POWER: (19, lambda x: x, None),  # Rated Power, raw value (kW)
-        ATTR_INVERTER_TEMP: (
-            20,
-            lambda x: x,
-            None,
-        ),  # Inverter Temperature, raw value (Celsius)
-        ATTR_BATTERY_STATUS_TEXT: (
-            21,
-            lambda x: "Idle"
-            if x == 0
-            else "Charging"
-            if x == 1
-            else "In Use"
-            if x == 5
-            else f"Unknown {x}",
-            None,
-        ),  # Battery status text mapping
+        4: "Battery Energy Management",
     }
 
     def __init__(self, data: dict) -> None:
-        """Initialise with mqtt data."""
+        """Initialize with parsed telemetry data."""
         self.data = data
 
     def __getattr__(self, name: str):
-        """Return a processed attribute."""
+        """Return attribute from parsed data, matching legacy naming."""
         try:
-            if self.data["msgType"] == 0 and self.data["valType"] == 7:
-                if name in [ATTR_INVERTER_TEMP]:
-                    return self.data['dataList'][5]['dataList'][0]['val']
-            elif self.data["msgType"] == 0 and self.data["valType"] == 0:
-                if name in [
-                    ATTR_GRID_IMPORT,
-                    ATTR_GRID_EXPORT,
-                    ATTR_BATTERY_IMPORT,
-                    ATTR_BATTERY_EXPORT,
-                ]:
-                    if (name == ATTR_GRID_IMPORT and self.data["gridLine"] == 2) or (
-                        name == ATTR_GRID_EXPORT and self.data["gridLine"] == 1
-                    ):
-                        return self.data[ATTR_GRID_POWER]
-                    if (name == ATTR_BATTERY_IMPORT and self.data["batteryLine"] == 2) or (
-                        name == ATTR_BATTERY_EXPORT and self.data["batteryLine"] == 1
-                    ):
-                        return self.data[ATTR_BATTERY_POWER]
-
-                    return 0
-
-                attr_info = self.attr_map.get(name)
-                if not attr_info:
-                    raise AttributeError(f"Attribute '{name}' not found in attr_map")
-
-                raw_value = self.data[name]
-
-                if attr_info[1]:
-                    return attr_info[1](raw_value)
-
-                return raw_value
+            # Special handling for mode - ALWAYS return mode name string
+            # This is needed because select entity expects the mode name, not code
+            if name == "code" or name == ATTR_SCHEDULE_MODE:
+                mode_code = self.data.get("code", 1)
+                if isinstance(mode_code, int):
+                    return self.modes.get(mode_code, f"Unknown Mode ({mode_code})")
+                return mode_code
             
-            raise AttributeError(f"Attribute '{name}' not found in attr_map")
-        
+            # Direct key lookup
+            if name in self.data:
+                return self.data[name]
+            
+            # Legacy attribute name mappings
+            legacy_map = {
+                ATTR_SOC: "batterySoc",
+                ATTR_GRID_POWER: "gridPower",
+                ATTR_LOAD_POWER: "loadPower",
+                ATTR_BATTERY_POWER: "batteryPower",
+                ATTR_PV_POWER: "pvPower",
+                ATTR_BATTERY_IMPORT: "batteryImport",
+                ATTR_BATTERY_EXPORT: "batteryExport",
+                ATTR_GRID_IMPORT: "gridImport",
+                ATTR_GRID_EXPORT: "gridExport",
+                ATTR_GRID_ACTIVE: "gridLine",
+                ATTR_LOAD_ACTIVE: "loadLine",
+                ATTR_PV_ACTIVE: "pvLine",
+                ATTR_BATTERY_ACTIVE: "batteryLine",
+                ATTR_HEATER_STATE: "heatingState",
+                ATTR_BATTERY_STATUS: "batteryStatus",
+                ATTR_SYSTEM_RUN_STATUS: "systemRunStatus",
+                ATTR_DAILY_POWER_GEN: "dailyPowerGeneration",
+                ATTR_RATED_POWER: "ratedPower",
+                ATTR_INVERTER_TEMP: "inverterTemp",
+                ATTR_BATTERY_STATUS_TEXT: "batteryStatusText",
+            }
+            
+            mapped_key = legacy_map.get(name, name)
+            if mapped_key in self.data:
+                return self.data[mapped_key]
+            
+            raise AttributeError(f"Attribute '{name}' not found in data")
+            
         except (IndexError, KeyError) as e:
-            raise AttributeError from e
+            raise AttributeError(f"Attribute '{name}' not found") from e
 
 
 class MessageListener:
-    """Message Listener."""
-
-    def __init__(self, coordinator) -> None:
-        """Initialise listener."""
-        self.coordinator = coordinator
+    """Message Listener interface."""
 
     def on_message(self, state: BatteryState) -> None:
         """Handle incoming messages."""
-        with contextlib.suppress(AttributeError):
-            self.coordinator.set_update_interval(fast=True)
-        self.coordinator.async_set_updated_data(state)
+        pass
 
 
 class EsySunhomeBattery:
-    """EsySunhome Battery Controller."""
+    """EsySunhome Battery Controller using binary MQTT protocol."""
 
-    def __init__(self, username: str, password: str, device_id: str) -> None:
-        """Initialize."""
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        device_id: str,
+        device_sn: str = None,
+    ) -> None:
+        """Initialize.
+        
+        Args:
+            username: ESY account username
+            password: ESY account password  
+            device_id: Device ID (numeric)
+            device_sn: Device serial number (for MQTT topic, defaults to device_id)
+        """
         self.username = username
         self.password = password
         self.device_id = device_id
-        self.subscribe_topic = f"/APP/{device_id}/NEWS"
+        self.device_sn = device_sn or device_id
+        
+        # Binary protocol topic
+        self.subscribe_topic = f"/ESY/PVVC/{self.device_sn}/UP"
+        
         self.api = None
-
+        self.parser = ESYTelemetryParser()
+        
         self._client = None
         self._connected = False
         self._listener_task = None
+        self._last_state: Optional[BatteryState] = None
 
     async def request_api_update(self):
-        """Trigger the API call to publish data"""
+        """Trigger the API call to publish data."""
         if not self.api:
             self.api = ESYSunhomeAPI(self.username, self.password, self.device_id)
         await self.api.request_update()
@@ -244,30 +193,42 @@ class EsySunhomeBattery:
         self._listener_task = asyncio.create_task(self._listen(listener))
 
     async def _listen(self, listener: MessageListener):
-        loop = asyncio.get_running_loop()
-
+        """Main MQTT listening loop."""
         self._connected = True
+        
         while self._connected:
             try:
+                _LOGGER.info(
+                    "Connecting to MQTT broker %s:%d (topic: %s)",
+                    ESY_MQTT_BROKER_URL,
+                    ESY_MQTT_BROKER_PORT,
+                    self.subscribe_topic
+                )
+                
                 async with aiomqtt.Client(
-                    hostname=ESY_MQTT_BROKER_URL, port=ESY_MQTT_BROKER_PORT
+                    hostname=ESY_MQTT_BROKER_URL,
+                    port=ESY_MQTT_BROKER_PORT,
+                    username=ESY_MQTT_USERNAME,
+                    password=ESY_MQTT_PASSWORD,
                 ) as self._client:
-                    _LOGGER.debug("Connected, subscribing to %s", self.subscribe_topic)
-
+                    _LOGGER.info("Connected, subscribing to %s", self.subscribe_topic)
                     await self._client.subscribe(self.subscribe_topic)
 
-                    # Request initial update if necessary
+                    # Request initial update
                     await self.request_api_update()
 
-                    # process messages
+                    # Process messages
                     async for message in self._client.messages:
                         self._process_message(message, listener)
 
             except aiomqtt.MqttError as mqtt_err:
-                _LOGGER.warning("Waiting for retry, error: %s", mqtt_err)
+                _LOGGER.warning("MQTT error, will retry in 5s: %s", mqtt_err)
                 self._client = None
+            except asyncio.CancelledError:
+                _LOGGER.debug("MQTT loop cancelled")
+                break
             except Exception as e:
-                _LOGGER.error("Exception in MQTT loop: %s", e)
+                _LOGGER.error("Exception in MQTT loop: %s", e, exc_info=True)
             finally:
                 await asyncio.sleep(5)
 
@@ -280,62 +241,102 @@ class EsySunhomeBattery:
         try:
             await self._listener_task
         except asyncio.CancelledError:
-            _LOGGER.debug("listener is cancelled")
+            _LOGGER.debug("Listener cancelled")
         self._listener_task = None
         self._client = None
 
     def _process_message(self, message, listener: MessageListener):
+        """Process incoming binary MQTT message."""
         try:
-            data = json.loads(message.payload)
-            val = data.get("val")
-            msgType = data.get("msgType")
-            valType = data.get("valType")
-            if val:
-                battery_data = json.loads(val)
-                battery_data["msgType"] = msgType
-                battery_data["valType"] = valType
-                _LOGGER.debug("Received battery data: %s", battery_data)
-                state = BatteryState(battery_data)
+            payload = message.payload
+            topic = str(message.topic)
+            
+            _LOGGER.debug("MQTT message received on %s (%d bytes)", topic, len(payload))
+            _LOGGER.debug("=== MQTT TELEMETRY RECEIVED ===")
+            _LOGGER.debug("Payload length: %d bytes", len(payload))
+            _LOGGER.debug("Payload (hex): %s...", payload[:100].hex())
+            
+            # Parse binary payload
+            data = self.parser.parse_message(payload)
+            
+            if data:
+                state = BatteryState(data)
+                self._last_state = state
+                
+                # Log summary
+                _LOGGER.debug("=== PARSED TELEMETRY SUMMARY ===")
+                _LOGGER.debug("  PV1 Power: %sW", data.get("pv1Power", "N/A"))
+                _LOGGER.debug("  PV2 Power: %sW", data.get("pv2Power", "N/A"))
+                _LOGGER.debug("  Battery SOC: %s%%", data.get("batterySoc", "N/A"))
+                _LOGGER.debug("  Battery Power: %sW", data.get("batteryPower", "N/A"))
+                _LOGGER.debug("  Battery Voltage: %sV", data.get("batteryVoltage", "N/A"))
+                _LOGGER.debug("  Battery Current: %sA", data.get("batteryCurrent", "N/A"))
+                _LOGGER.debug("  Grid Power: %sW", data.get("gridPower", "N/A"))
+                _LOGGER.debug("  Load Power: %sW", data.get("loadPower", "N/A"))
+                _LOGGER.debug("  Inverter Temp: %s°C", data.get("inverterTemp", "N/A"))
+                _LOGGER.debug("  Daily Generation: %skWh", data.get("dailyPowerGeneration", "N/A"))
+                _LOGGER.debug("  Grid Mode: %s", data.get("onOffGridMode", "N/A"))
+                _LOGGER.debug("================================")
+                
                 listener.on_message(state)
             else:
-                _LOGGER.warning("No valid battery data found")
-        except (json.JSONDecodeError, IndexError, AttributeError) as e:
-            _LOGGER.error("Error processing data(%s): %s", e, message.payload)
+                _LOGGER.warning("Failed to parse binary payload")
+
+        except Exception as e:
+            _LOGGER.error("Error processing message: %s", e, exc_info=True)
 
     async def request_update(self) -> None:
         """Send MQTT update request to controller."""
         await self.request_api_update()
 
     async def set_value(self, value_name: str, value: int) -> None:
+        """Set a value via API."""
         if not self.api:
-            self.api = ESYSunhomeAPI(self.username, self.password, self.device_id)  
+            self.api = ESYSunhomeAPI(self.username, self.password, self.device_id)
 
-        if (value_name == ATTR_SCHEDULE_MODE):
+        if value_name == ATTR_SCHEDULE_MODE:
             await self.api.set_mode(value)
 
 
 async def main():
     """Test harness."""
-
-    class LogMessageListener(MessageListener):
+    import sys
+    
+    class LogListener(MessageListener):
         def on_message(self, state: BatteryState) -> None:
-            _LOGGER.info(state)
+            print(f"SOC: {state.batterySoc}%")
+            print(f"PV: {state.pvPower}W")
+            print(f"Grid: {state.gridPower}W")
+            print(f"Battery: {state.batteryPower}W")
+            print(f"Load: {state.loadPower}W")
+            print("---")
 
-    esy_battery = EsySunhomeBattery(
-	username="user@test.com",
-	password="password",
-        device_id=12345
-    )  # Replace with your actual device ID
+    if len(sys.argv) < 4:
+        print("Usage: python battery.py <username> <password> <device_id> [device_sn]")
+        return
 
-    await esy_battery.connect(LogMessageListener())
-
-    while True:
-        _LOGGER.debug("Requesting update")
-        await esy_battery.request_update()
-        await asyncio.sleep(10)
+    device_sn = sys.argv[4] if len(sys.argv) > 4 else sys.argv[3]
+    
+    battery = EsySunhomeBattery(
+        username=sys.argv[1],
+        password=sys.argv[2],
+        device_id=sys.argv[3],
+        device_sn=device_sn,
+    )
+    
+    battery.connect(LogListener())
+    
+    try:
+        while True:
+            await asyncio.sleep(30)
+            await battery.request_update()
+    except KeyboardInterrupt:
+        await battery.disconnect()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s %(levelname)s %(name)s: %(message)s'
+    )
     asyncio.run(main())
-

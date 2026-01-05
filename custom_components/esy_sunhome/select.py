@@ -9,7 +9,13 @@ from homeassistant.exceptions import HomeAssistantError
 
 from .battery import BatteryState
 from .entity import EsySunhomeEntity
-from .const import ATTR_SCHEDULE_MODE
+from .const import (
+    ATTR_SCHEDULE_MODE,
+    CONF_MODE_CHANGE_METHOD,
+    MODE_CHANGE_API,
+    MODE_CHANGE_MQTT,
+    DEFAULT_MODE_CHANGE_METHOD,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,7 +35,7 @@ async def async_setup_entry(
 ) -> None:
     async_add_entities(
         [
-            ModeSelect(coordinator=entry.runtime_data),
+            ModeSelect(coordinator=entry.runtime_data, config_entry=entry),
         ]
     )
 
@@ -43,15 +49,24 @@ class ModeSelect(EsySunhomeEntity, SelectEntity):
     _attr_name = "Operating Mode"
     _attr_icon = ICON_NORMAL
 
-    def __init__(self, coordinator):
+    def __init__(self, coordinator, config_entry: ConfigEntry):
         """Initialize the mode select entity."""
         super().__init__(coordinator)
+        self._config_entry = config_entry
         self._pending_mode_name = None     # Mode NAME we're trying to change to (string)
         self._pending_mode_key = None      # Mode KEY we're trying to change to (int)
         self._retry_count = 0
         self._confirmation_timeout = None
         self._actual_mqtt_mode_name = None # What MQTT actually says (string)
         self._is_loading = False
+
+    @property
+    def _use_mqtt_for_mode_change(self) -> bool:
+        """Check if MQTT should be used for mode changes instead of API."""
+        method = self._config_entry.options.get(
+            CONF_MODE_CHANGE_METHOD, DEFAULT_MODE_CHANGE_METHOD
+        )
+        return method == MODE_CHANGE_MQTT
 
     @property
     def icon(self) -> str:
@@ -66,6 +81,7 @@ class ModeSelect(EsySunhomeEntity, SelectEntity):
             "pending_mode": self._pending_mode_name,
             "actual_mode": self._actual_mqtt_mode_name,
             "retry_count": self._retry_count if self._is_loading else 0,
+            "mode_change_method": "mqtt" if self._use_mqtt_for_mode_change else "api",
         }
 
     @callback
@@ -153,36 +169,69 @@ class ModeSelect(EsySunhomeEntity, SelectEntity):
         await self._attempt_mode_change(option, mode_key)
 
     async def _attempt_mode_change(self, mode_name: str, mode_key: int) -> None:
-        """Attempt to change mode with API request.
+        """Attempt to change mode via API or MQTT based on configuration.
+        
+        Two methods available (configurable in integration options):
+        
+        API (default, like the app):
+          App → POST /api/lsypattern/switch → ESY Server → MQTT to inverter
+          The ESY server is responsible for sending the MQTT command.
+        
+        MQTT (direct, faster for HA automations):
+          HA → MQTT command → Inverter (bypasses cloud)
+          Note: BEM (Battery Energy Management) always uses API because it's
+          a server-side scheduling feature, not a simple register write.
         
         Args:
             mode_name: The mode name being changed to (string)
             mode_key: The mode code being changed to (int)
         """
+        # BEM (mode_key 5) MUST use API - it's a server-side scheduling feature
+        # MQTT register 57 value 5 = "AC Charging off emergency backup mode" which is different!
+        # The server translates API code 5 (BEM) to register 57 = 1 (Regular) internally
+        is_bem = (mode_key == 5)
+        use_mqtt = self._use_mqtt_for_mode_change and not is_bem
+        
         try:
-            # Send the API request (with built-in retry logic)
-            await self.coordinator.api.set_value(ATTR_SCHEDULE_MODE, mode_key)
+            if use_mqtt:
+                # Direct MQTT method - send command directly to inverter
+                mqtt_success = await self.coordinator.set_mode_mqtt(mode_key)
+                
+                if mqtt_success:
+                    _LOGGER.info(
+                        f"✓ MQTT command sent for mode change to: {mode_name}. "
+                        f"Waiting for confirmation... (attempt {self._retry_count + 1}/{MAX_RETRIES + 1})"
+                    )
+                else:
+                    raise Exception("MQTT publish failed")
+                
+                method_status = "mqtt_sent"
+                method_used = "mqtt"
+            else:
+                # API method (like the app does)
+                # The ESY server will then send the MQTT command to the inverter
+                if is_bem and self._use_mqtt_for_mode_change:
+                    _LOGGER.info(
+                        f"BEM requires API (server-side scheduling) - using API despite MQTT setting"
+                    )
+                await self.coordinator.api.set_mode(mode_key)
+                _LOGGER.info(
+                    f"✓ API call sent for mode change to: {mode_name}. "
+                    f"Server will send MQTT to inverter. (attempt {self._retry_count + 1}/{MAX_RETRIES + 1})"
+                )
+                method_status = "api_sent"
+                method_used = "api"
             
-            _LOGGER.info(
-                f"✓ API request successful for mode change to: {mode_name}. "
-                f"Waiting for MQTT confirmation... (attempt {self._retry_count + 1}/{MAX_RETRIES + 1})"
-            )
-            
-            # Request an MQTT update so we get confirmation even if polling is disabled
-            try:
-                await self.coordinator.api.request_update()
-                _LOGGER.debug("Requested MQTT update for mode change confirmation")
-            except Exception as e:
-                _LOGGER.debug(f"Could not request MQTT update: {e}")
-            
-            # Fire event for API request success
+            # Fire event for request success
             self.hass.bus.async_fire(
                 "esy_sunhome_mode_change_requested",
                 {
                     "device_id": self.coordinator.api.device_id,
                     "mode": mode_name,
                     "mode_code": mode_key,
-                    "status": "api_success",
+                    "status": method_status,
+                    "method": method_used,
+                    "forced_api": is_bem and self._use_mqtt_for_mode_change,
                     "attempt": self._retry_count + 1
                 }
             )
@@ -191,10 +240,10 @@ class ModeSelect(EsySunhomeEntity, SelectEntity):
             self._schedule_confirmation_timeout(mode_name, mode_key)
             
         except Exception as err:
-            error_msg = f"Failed to send API request for mode {mode_name}: {err}"
+            error_msg = f"Failed to send mode change command for {mode_name}: {err}"
             _LOGGER.error(error_msg)
             
-            # Revert to actual MQTT state on API error
+            # Revert to actual MQTT state on error
             if self._actual_mqtt_mode_name:
                 self._attr_current_option = self._actual_mqtt_mode_name
             
@@ -309,20 +358,26 @@ class ModeSelect(EsySunhomeEntity, SelectEntity):
                     }
                 )
                 
-                # Retry the API request
+                # Retry using configured method (BEM always uses API)
+                is_bem = (mode_key == 5)
+                use_mqtt = self._use_mqtt_for_mode_change and not is_bem
+                
                 try:
-                    await self.coordinator.api.set_value(ATTR_SCHEDULE_MODE, mode_key)
-                    _LOGGER.info(
-                        f"✓ Retry API request sent for mode: {mode_name} "
-                        f"(attempt {self._retry_count + 1}/{MAX_RETRIES + 1})"
-                    )
-                    
-                    # Request an MQTT update so we get confirmation even if polling is disabled
-                    try:
-                        await self.coordinator.api.request_update()
-                        _LOGGER.debug("Requested MQTT update for retry confirmation")
-                    except Exception as e:
-                        _LOGGER.debug(f"Could not request MQTT update: {e}")
+                    if use_mqtt:
+                        mqtt_success = await self.coordinator.set_mode_mqtt(mode_key)
+                        if mqtt_success:
+                            _LOGGER.info(
+                                f"✓ Retry MQTT command sent for mode: {mode_name} "
+                                f"(attempt {self._retry_count + 1}/{MAX_RETRIES + 1})"
+                            )
+                        else:
+                            raise Exception("MQTT publish failed")
+                    else:
+                        await self.coordinator.api.set_mode(mode_key)
+                        _LOGGER.info(
+                            f"✓ Retry API call sent for mode: {mode_name} "
+                            f"(attempt {self._retry_count + 1}/{MAX_RETRIES + 1})"
+                        )
                     
                     # Schedule another timeout
                     self._schedule_confirmation_timeout(mode_name, mode_key)
@@ -384,15 +439,22 @@ class ModeSelect(EsySunhomeEntity, SelectEntity):
         )
 
     def get_mode_key(self, value: str) -> int:
-        """Get the mode code (int) for a given mode name (string).
+        """Get the mode code to send for a given mode name.
+        
+        Based on APK analysis:
+        - Regular Mode -> code 1
+        - Emergency Mode -> code 4 (API) / register 4 (MQTT)
+        - Electricity Sell Mode -> code 3
+        - Battery Energy Management -> code 5 (API only!)
+        
+        Note: BEM (code 5) is a server-side scheduling feature. Writing
+        MQTT register 57 = 5 activates "AC Charging off emergency backup mode"
+        which is a different mode! BEM always uses the API.
         
         Args:
             value: The operating mode name (e.g., "Regular Mode")
             
         Returns:
-            The mode code (integer) or None if not found
+            The mode code to send, or None if not found
         """
-        for key, mode in BatteryState.modes.items():
-            if mode == value:
-                return key
-        return None
+        return BatteryState.modes_to_mqtt.get(value)

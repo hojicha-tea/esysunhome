@@ -47,9 +47,10 @@ class EsyBinarySensorBase(EsySunhomeEntity, BinarySensorEntity):
     @callback
     def _handle_coordinator_update(self) -> None:
         if hasattr(self.coordinator.data, self._attr_translation_key):
-            self._attr_is_on = getattr(
-                self.coordinator.data, self._attr_translation_key
-            ) == 1
+            # Values: 0=inactive, 1=flow direction A, 2=flow direction B
+            # Consider active if value is non-zero
+            value = getattr(self.coordinator.data, self._attr_translation_key)
+            self._attr_is_on = value is not None and value != 0
             self.async_write_ha_state()
 
 
