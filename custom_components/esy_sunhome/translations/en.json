@@ -39,7 +39,11 @@
             "init": {
                 "title": "ESY Sunhome Options",
                 "data": {
-                    "enable_polling": "Enable API polling (fallback when MQTT unavailable)"
+                    "enable_polling": "Enable API polling (fallback when MQTT unavailable)",
+                    "mode_change_method": "Mode change method"
+                },
+                "data_description": {
+                    "mode_change_method": "API: Uses cloud API like the app (server sends MQTT). MQTT: Sends commands directly to inverter (faster, better for HA automations)."
                 }
             }
         }

@@ -35,6 +35,11 @@ CONF_ENABLE_POLLING = "enable_polling"
 CONF_PV_POWER = "pv_power"
 CONF_TP_TYPE = "tp_type"
 CONF_MCU_VERSION = "mcu_version"
+CONF_MODE_CHANGE_METHOD = "mode_change_method"
+
+# Mode change method options
+MODE_CHANGE_API = "api"      # Use API (like the app does) - default
+MODE_CHANGE_MQTT = "mqtt"    # Use direct MQTT commands
 
 # Attribute Keys
 ATTR_DEVICE_ID = "deviceId"
@@ -43,6 +48,7 @@ DEFAULT_ENABLE_POLLING = True
 DEFAULT_PV_POWER = 6
 DEFAULT_TP_TYPE = 1
 DEFAULT_MCU_VERSION = 1049
+DEFAULT_MODE_CHANGE_METHOD = MODE_CHANGE_API
 
 # Core Power Sensors
 ATTR_SOC = "batterySoc"

@@ -321,6 +321,7 @@ class ESYSunhomeAPI:
         
         _LOGGER.info(f"Setting mode to {mode} for device {self.device_id}")
         
+        # APK uses form data, not JSON body
         # Parameters: code (mode code), deviceId
         form_data = {
             "code": str(mode),

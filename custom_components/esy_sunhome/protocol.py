@@ -341,19 +341,21 @@ class DynamicTelemetryParser:
         # So we need to FLIP the sign from ESY convention
         result["gridPower"] = -grid_power  # Flip sign for HA convention
         
+        # Apply sign convention for import/export
         if grid_power < 0:
             # ESY negative = importing from grid
             result["gridImport"] = abs(grid_power)
             result["gridExport"] = 0
+            result["gridLine"] = 1
         elif grid_power > 0:
             # ESY positive = exporting to grid
             result["gridImport"] = 0
             result["gridExport"] = grid_power
+            result["gridLine"] = 1
         else:
             result["gridImport"] = 0
             result["gridExport"] = 0
-        
-        result["gridLine"] = 1 if grid_power != 0 else 0
+            result["gridLine"] = 0
         
         _LOGGER.debug("Grid: ct1=%d, ct2=%d, active=%d, flow=%d -> power=%d [%s] (import=%d, export=%d)",
                      ct1_power, ct2_power, grid_active_power, int(energy_flow_grid),
@@ -424,12 +426,12 @@ class DynamicTelemetryParser:
         result["batteryStatus"] = battery_status
         
         # Directional battery power for HA sensors
-        if is_discharging:
+        if is_discharging and batt_power > 0:
             result["batteryImport"] = 0
             result["batteryExport"] = batt_power  # Discharging = export (from battery)
             result["batteryStatusText"] = status_text
             result["batteryLine"] = 1
-        elif is_charging:
+        elif is_charging and batt_power > 0:
             result["batteryImport"] = batt_power  # Charging = import (into battery)
             result["batteryExport"] = 0
             result["batteryStatusText"] = status_text
@@ -568,11 +570,12 @@ class ESYCommandBuilder:
         value: int,
         user_id: bytes = None,
         msg_id: int = 0,
+        config_id: int = 0,
     ) -> bytes:
         """Build a write command for a single register.
         
         Based on MQTT traffic analysis, write commands use:
-        - user_id ending in FF FC (captured from real traffic)
+        - user_id ending in FC 14 (confirmed from traffic analysis)
         - fun_code = 0x00
         - source_id = 0x10
         - page_index = 0x0800
@@ -588,6 +591,7 @@ class ESYCommandBuilder:
             value: Value to write
             user_id: 8-byte user ID (default: write command ID)
             msg_id: Message ID (use timestamp for uniqueness)
+            config_id: Config ID from protocol (some inverters may require this)
             
         Returns:
             Binary command to publish to DOWN topic
@@ -606,7 +610,7 @@ class ESYCommandBuilder:
         )
         
         header = MsgHeader(
-            config_id=0,
+            config_id=config_id,
             msg_id=msg_id,
             user_id=user_id,
             fun_code=0x00,      # Write command
@@ -622,6 +626,7 @@ class ESYCommandBuilder:
         writes: List[tuple],  # List of (address, values) tuples
         user_id: bytes = None,
         msg_id: int = 0,
+        config_id: int = 0,
     ) -> bytes:
         """Build a write command for multiple registers.
         
@@ -629,6 +634,7 @@ class ESYCommandBuilder:
             writes: List of (address, [values]) tuples
             user_id: 8-byte user ID (default: write command ID)
             msg_id: Message ID
+            config_id: Config ID from protocol (some inverters may require this)
             
         Returns:
             Binary command to publish to DOWN topic
@@ -648,7 +654,7 @@ class ESYCommandBuilder:
                 payload += struct.pack(">H", val)  # each value
         
         header = MsgHeader(
-            config_id=0,
+            config_id=config_id,
             msg_id=msg_id,
             user_id=user_id,
             fun_code=0x00,

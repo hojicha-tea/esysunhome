@@ -16,10 +16,14 @@ from .const import (
     CONF_PV_POWER,
     CONF_TP_TYPE,
     CONF_MCU_VERSION,
+    CONF_MODE_CHANGE_METHOD,
     DEFAULT_ENABLE_POLLING,
     DEFAULT_PV_POWER,
     DEFAULT_TP_TYPE,
     DEFAULT_MCU_VERSION,
+    DEFAULT_MODE_CHANGE_METHOD,
+    MODE_CHANGE_API,
+    MODE_CHANGE_MQTT,
     ESY_API_BASE_URL,
     ESY_API_DEVICE_ENDPOINT,
 )
@@ -246,6 +250,7 @@ class ESYSunhomeFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             },
             options={
                 CONF_ENABLE_POLLING: DEFAULT_ENABLE_POLLING,
+                CONF_MODE_CHANGE_METHOD: DEFAULT_MODE_CHANGE_METHOD,
             },
         )
 
@@ -277,5 +282,14 @@ class OptionsFlowHandler(config_entries.OptionsFlow):
                         CONF_ENABLE_POLLING, DEFAULT_ENABLE_POLLING
                     ),
                 ): bool,
+                vol.Optional(
+                    CONF_MODE_CHANGE_METHOD,
+                    default=self.config_entry.options.get(
+                        CONF_MODE_CHANGE_METHOD, DEFAULT_MODE_CHANGE_METHOD
+                    ),
+                ): vol.In({
+                    MODE_CHANGE_API: "API (like the app)",
+                    MODE_CHANGE_MQTT: "Direct MQTT (faster, for HA automation)",
+                }),
             }),
         )

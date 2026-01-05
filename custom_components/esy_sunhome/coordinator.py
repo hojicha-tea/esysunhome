@@ -453,10 +453,17 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         # Use Unix timestamp as msg_id (like the app does)
         msg_id = int(time.time())
         
+        # Get config_id from protocol if available
+        config_id = 0
+        if self.protocol:
+            config_id = self.protocol.config_id
+            _LOGGER.debug("Using config_id=%d from protocol", config_id)
+        
         command = ESYCommandBuilder.build_write_command(
             register_address=MODE_REGISTER,
             value=mode_code,
             msg_id=msg_id,
+            config_id=config_id,
         )
         
         _LOGGER.info("Sending mode change command via MQTT: register=%d, value=%d (mode=%s), msg_id=%d",
@@ -495,13 +502,18 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         
         self._poll_msg_id += 1
         
+        # Get config_id from protocol if available
+        config_id = self.protocol.config_id if self.protocol else 0
+        
         command = ESYCommandBuilder.build_write_command(
             register_address=register_address,
             value=value,
             msg_id=self._poll_msg_id,
+            config_id=config_id,
         )
         
-        _LOGGER.info("Writing register via MQTT: addr=%d, value=%d", register_address, value)
+        _LOGGER.info("Writing register via MQTT: addr=%d, value=%d, config_id=%d", 
+                    register_address, value, config_id)
         return await self.publish_command(command)
     
     async def write_registers(self, writes: list) -> bool:
@@ -517,12 +529,16 @@ class ESYSunhomeCoordinator(DataUpdateCoordinator):
         
         self._poll_msg_id += 1
         
+        # Get config_id from protocol if available
+        config_id = self.protocol.config_id if self.protocol else 0
+        
         command = ESYCommandBuilder.build_multi_write_command(
             writes=writes,
             msg_id=self._poll_msg_id,
+            config_id=config_id,
         )
         
-        _LOGGER.info("Writing %d register(s) via MQTT", len(writes))
+        _LOGGER.info("Writing %d register(s) via MQTT, config_id=%d", len(writes), config_id)
         return await self.publish_command(command)
         
     def update_protocol(self, protocol: ProtocolDefinition) -> None:
